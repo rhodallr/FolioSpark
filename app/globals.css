@@ -1,0 +1,57 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    @apply bg-paper text-ink font-sans;
+  }
+  ::selection {
+    background: #ffe8d9;
+    color: #1a1714;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition focus:outline-none focus-visible:ring-2 focus-visible:ring-spark/50 disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-ink text-paper hover:bg-ink-soft;
+  }
+  .btn-spark {
+    @apply btn bg-spark text-white hover:bg-spark-dark;
+  }
+  .btn-ghost {
+    @apply btn border border-paper-line bg-white text-ink hover:bg-paper-deep;
+  }
+  .input {
+    @apply w-full rounded-xl border border-paper-line bg-white px-3 py-2 text-sm text-ink placeholder:text-ink-muted/70 focus:border-spark focus:outline-none focus:ring-2 focus:ring-spark/20;
+  }
+  .label {
+    @apply mb-1 block text-xs font-semibold uppercase tracking-wider text-ink-muted;
+  }
+}
+
+@layer utilities {
+  .preserve-3d {
+    transform-style: preserve-3d;
+  }
+  .backface-hidden {
+    backface-visibility: hidden;
+    -webkit-backface-visibility: hidden;
+  }
+  .rotate-y-180 {
+    transform: rotateY(180deg);
+  }
+  .perspective {
+    perspective: 1000px;
+  }
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: #e7e0d6 transparent;
+  }
+}
