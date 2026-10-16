@@ -1,4 +1,5 @@
 import { Fraunces, Inter } from 'next/font/google';
+import { Analytics } from '@vercel/analytics/next';
 import Navbar from '@/components/Navbar';
 import './globals.css';
 
@@ -21,6 +22,7 @@ export default function RootLayout({ children }) {
       <body className="min-h-screen bg-paper text-ink">
         <Navbar />
         {children}
+        <Analytics />
       </body>
     </html>
   );
