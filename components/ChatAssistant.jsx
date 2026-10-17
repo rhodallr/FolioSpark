@@ -1,6 +1,6 @@
 'use client';
 
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowUp,
   Check,
@@ -8,15 +8,22 @@ import {
   ClipboardCheck,
   GitBranch,
   Link2,
+  Loader2,
+  Maximize2,
+  Minimize2,
   PenLine,
   Plus,
+  RefreshCw,
   Settings2,
   SkipForward,
   Sparkles,
   Target,
   Trash2,
+  Undo2,
+  Wand2,
   X,
 } from 'lucide-react';
+import { LONG_SENTENCE, REWRITE_MODES, quickTidy, textStats } from '@/lib/rewrite';
 import {
   GOALS,
   PHASES,
@@ -88,6 +95,15 @@ function askFor(index, alignment) {
   }
   parts.push(step.prompt);
   return parts.join('\n');
+}
+
+// Offer a one-click fix when the answer is long or hard to scan.
+function polishActionsFor(stepId, text) {
+  if (['title', 'timeline'].includes(stepId)) return [];
+  const s = textStats(text);
+  if (s.words > 110) return [{ type: 'polish', stepId, mode: 'condense' }];
+  if (s.longCount > 0) return [{ type: 'polish', stepId, mode: 'shorten' }];
+  return [];
 }
 
 function feedbackFor(stepId, text, before, after) {
@@ -245,7 +261,7 @@ function OnboardingModal({ initial, onSubmit, onClose, isFirstRun }) {
                   <textarea
                     value={job}
                     onChange={(e) => setJob(i, e.target.value)}
-                    rows={job.length > 120 ? 4 : 2}
+                    rows={job.length > 300 ? 8 : 4}
                     className="input resize-y"
                     placeholder="Paste the job description text (best), or a link"
                     aria-label={`Job description ${i + 1}`}
@@ -323,9 +339,15 @@ export default function ChatAssistant({ project, update, alignment }) {
   const [styleUrl, setStyleUrl] = useState('');
   const [styleNote, setStyleNote] = useState('');
   const [diagram, setDiagram] = useState({ type: 'flow', title: '', steps: '' });
+  const [rewriting, setRewriting] = useState(null); // mode currently running
+  const [suggestion, setSuggestion] = useState(null); // { mode, text, source, original, reason }
+  const [undoText, setUndoText] = useState(null);
+  const [rewriteError, setRewriteError] = useState('');
+  const [expanded, setExpanded] = useState(false);
   const listRef = useRef(null);
   const inputRef = useRef(null);
   const timers = useRef([]);
+  const rewriteSeq = useRef(0);
 
   const currentStep = STEPS[flow.step];
   const editingStep = flow.editing ? STEPS.find((s) => s.id === flow.editing) : null;
@@ -341,6 +363,70 @@ export default function ChatAssistant({ project, update, alignment }) {
   useEffect(() => {
     if (listRef.current) listRef.current.scrollTo({ top: listRef.current.scrollHeight, behavior: 'smooth' });
   }, [chat.length, typing]);
+
+  // Grow the text box with its content (never shrinking below a size the user dragged it to).
+  useLayoutEffect(() => {
+    const el = inputRef.current;
+    if (!el || expanded) return;
+    if (!input) {
+      el.style.height = '';
+      return;
+    }
+    const max = Math.round(window.innerHeight * 0.3);
+    if (el.scrollHeight > el.clientHeight && el.clientHeight < max) {
+      el.style.height = `${Math.min(el.scrollHeight + 2, max)}px`;
+    }
+  }, [input, expanded]);
+
+  // ----- Writing helper -----
+
+  async function rewrite(mode, sourceText = input, step = activeStep) {
+    const text = String(sourceText || '').trim();
+    if (!text || rewriting) return;
+    const seq = ++rewriteSeq.current;
+    setRewriting(mode);
+    setRewriteError('');
+    try {
+      const res = await fetch('/api/rewrite', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ text, mode, section: step?.id || '', sectionLabel: step?.label || '' }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (seq !== rewriteSeq.current) return;
+      if (!res.ok) {
+        setRewriteError(data.error || 'The rewrite didn’t work. Try again in a moment.');
+        return;
+      }
+      setSuggestion({ mode, text: data.text, source: data.source, reason: data.reason, original: text });
+    } catch {
+      if (seq !== rewriteSeq.current) return;
+      // Offline or route unavailable — still help with a local tidy.
+      setSuggestion({ mode, text: quickTidy(text, mode), source: 'rules', reason: 'network', original: text });
+    } finally {
+      if (seq === rewriteSeq.current) setRewriting(null);
+    }
+  }
+
+  function acceptSuggestion() {
+    if (!suggestion) return;
+    setUndoText(input);
+    setInput(suggestion.text);
+    setSuggestion(null);
+    setTimeout(() => inputRef.current?.focus(), 0);
+  }
+
+  function undoSuggestion() {
+    if (undoText === null) return;
+    setInput(undoText);
+    setUndoText(null);
+  }
+
+  function discardSuggestion() {
+    rewriteSeq.current += 1;
+    setSuggestion(null);
+    setRewriting(null);
+  }
 
   // Assistant replies arrive after a short pause so the exchange feels conversational.
   function reply(messages) {
@@ -394,6 +480,10 @@ export default function ChatAssistant({ project, update, alignment }) {
     const text = String(raw ?? input).trim();
     if (!text || typing) return;
     setInput('');
+    setSuggestion(null);
+    setUndoText(null);
+    setRewriteError('');
+    setExpanded(false);
     const userMsg = msg('user', text);
 
     if (editingStep) {
@@ -407,7 +497,8 @@ export default function ChatAssistant({ project, update, alignment }) {
       }));
       const fb = feedbackFor(editingStep.id, text, alignment, after);
       const follow = currentStep ? `\n\nBack to where we were:\n${currentStep.prompt}` : '';
-      reply([msg('assistant', `Updated **${editingStep.label}**. ${fb}${follow}`)]);
+      const polish = polishActionsFor(editingStep.id, text);
+      reply([msg('assistant', `Updated **${editingStep.label}**. ${fb}${follow}`, polish.length ? { actions: polish } : {})]);
       return;
     }
 
@@ -422,7 +513,8 @@ export default function ChatAssistant({ project, update, alignment }) {
         flow: { ...p.flow, step: nextIndex },
       }));
       const fb = feedbackFor(currentStep.id, text, alignment, after);
-      const out = [msg('assistant', fb)];
+      const polish = polishActionsFor(currentStep.id, text);
+      const out = [msg('assistant', fb, polish.length ? { actions: polish } : {})];
       if (STEPS[nextIndex]) {
         out.push(msg('assistant', askFor(nextIndex, after)));
       } else {
@@ -501,9 +593,21 @@ export default function ChatAssistant({ project, update, alignment }) {
   function cancelRefine() {
     update((p) => ({ ...p, flow: { ...p.flow, editing: null } }));
     setInput('');
+    discardSuggestion();
+    setUndoText(null);
   }
 
   function runAction(action) {
+    if (typeof action === 'object' && action.type === 'polish') {
+      const step = STEPS.find((s) => s.id === action.stepId);
+      const text = fieldToText(action.stepId, content);
+      if (!step || !text) return;
+      setTool(null);
+      update((p) => ({ ...p, flow: { ...p.flow, editing: action.stepId } }));
+      setInput(text);
+      rewrite(action.mode, text, step);
+      return;
+    }
     if (typeof action === 'object' && action.type === 'theme') {
       update((p) => ({ ...p, content: { ...p.content, theme: action.value } }));
       reply([msg('assistant', `Applied the **${THEMES[action.value].label}** theme to the preview.`)]);
@@ -565,6 +669,7 @@ export default function ChatAssistant({ project, update, alignment }) {
 
   // ----- Derived UI -----
 
+  const stats = useMemo(() => textStats(input), [input]);
   const provenCount = alignment.filter((a) => a.proven).length;
   const phaseIndex = done && !editingStep ? PHASES.length : PHASES.indexOf(currentPhase);
   const placeholder = activeStep ? activeStep.placeholder : 'Ask for an audit, a diagram, or a layout change…';
@@ -628,7 +733,7 @@ export default function ChatAssistant({ project, update, alignment }) {
       </div>
 
       {/* Messages */}
-      <div ref={listRef} className="scrollbar-thin flex-1 space-y-3 overflow-y-auto px-4 py-4" aria-live="polite">
+      <div ref={listRef} className="scrollbar-thin min-h-[140px] flex-1 space-y-3 overflow-y-auto px-4 py-4" aria-live="polite">
         {chat.length === 0 && !typing && (
           <div className="grid h-full place-items-center text-center text-sm text-ink-muted">
             <div>
@@ -678,7 +783,16 @@ export default function ChatAssistant({ project, update, alignment }) {
                       onClick={() => runAction(a)}
                       className="rounded-full border border-paper-line bg-paper px-2.5 py-1 text-xs font-medium hover:border-spark hover:text-spark-dark"
                     >
-                      {typeof a === 'string' ? actionLabels[a] : `Apply ${THEMES[a.value].label} theme`}
+                      {typeof a === 'string' ? (
+                        actionLabels[a]
+                      ) : a.type === 'polish' ? (
+                        <span className="inline-flex items-center gap-1">
+                          <Wand2 className="h-3 w-3" />
+                          {a.mode === 'condense' ? 'Condense it for me' : 'Shorten the sentences for me'}
+                        </span>
+                      ) : (
+                        `Apply ${THEMES[a.value].label} theme`
+                      )}
                     </button>
                   ))}
                 </div>
@@ -795,7 +909,7 @@ export default function ChatAssistant({ project, update, alignment }) {
       )}
 
       {/* Composer */}
-      <div className="border-t border-paper-line bg-white p-3">
+      <div className="scrollbar-thin max-h-[70%] shrink-0 overflow-y-auto border-t border-paper-line bg-white p-3">
         {editingStep && (
           <div className="mb-2 flex items-center justify-between rounded-xl bg-spark-light/60 px-3 py-1.5 text-xs">
             <span className="flex items-center gap-1.5">
@@ -849,41 +963,149 @@ export default function ChatAssistant({ project, update, alignment }) {
           )}
         </div>
 
+        {suggestion && (
+          <div className="mb-2 animate-rise rounded-2xl border border-spark/40 bg-spark-light/40 p-3" role="region" aria-label="Suggested rewrite">
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+              <p className="flex items-center gap-1.5 text-xs font-semibold text-spark-dark">
+                <Wand2 className="h-3.5 w-3.5" />
+                {REWRITE_MODES[suggestion.mode].label}
+                <span className="font-normal text-ink-muted">
+                  · {textStats(suggestion.original).words} → {textStats(suggestion.text).words} words · longest sentence{' '}
+                  {textStats(suggestion.original).longest} → {textStats(suggestion.text).longest}
+                </span>
+              </p>
+              {suggestion.source === 'rules' && (
+                <span
+                  className="rounded-full bg-white px-2 py-0.5 text-[10px] font-medium text-ink-muted"
+                  title={
+                    suggestion.reason === 'no-key'
+                      ? 'Add an ANTHROPIC_API_KEY to enable AI rewrites'
+                      : 'The AI rewrite was unavailable, so this is a quick rule-based tidy'
+                  }
+                >
+                  Quick tidy · no AI
+                </span>
+              )}
+            </div>
+            <div className="scrollbar-thin max-h-40 overflow-y-auto whitespace-pre-wrap rounded-xl bg-white p-3 text-sm leading-relaxed">
+              {suggestion.text}
+            </div>
+            {suggestion.text.trim() === suggestion.original.trim() && (
+              <p className="mt-2 text-xs text-ink-muted">No changes needed for this one — it already reads well.</p>
+            )}
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              <button type="button" onClick={acceptSuggestion} className="btn-spark px-3 py-1.5 text-xs">
+                <Check className="h-3.5 w-3.5" /> Use this
+              </button>
+              <button
+                type="button"
+                onClick={() => rewrite(suggestion.mode, suggestion.original)}
+                disabled={Boolean(rewriting)}
+                className="btn-ghost px-3 py-1.5 text-xs"
+              >
+                {rewriting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />} Try again
+              </button>
+              <button type="button" onClick={discardSuggestion} className="btn-ghost px-3 py-1.5 text-xs">
+                Keep mine
+              </button>
+            </div>
+          </div>
+        )}
+
         <form
           onSubmit={(e) => {
             e.preventDefault();
             send();
           }}
-          className="flex items-end gap-2 rounded-2xl border border-paper-line bg-paper p-1.5 focus-within:border-spark focus-within:ring-2 focus-within:ring-spark/20"
+          className="rounded-2xl border border-paper-line bg-paper focus-within:border-spark focus-within:ring-2 focus-within:ring-spark/20"
         >
           <textarea
             ref={inputRef}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => {
+              setInput(e.target.value);
+              if (undoText !== null) setUndoText(null);
+            }}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault();
                 send();
               }
             }}
-            rows={Math.min(6, Math.max(1, input.split('\n').length))}
+            rows={4}
+            style={expanded ? { height: '50vh' } : undefined}
             placeholder={onboarding ? placeholder : 'Set your targets first…'}
             disabled={!onboarding}
-            className="scrollbar-thin max-h-40 min-h-[40px] flex-1 resize-none bg-transparent px-2.5 py-2 text-sm focus:outline-none disabled:cursor-not-allowed"
+            className="scrollbar-thin block min-h-[6.5rem] w-full resize-y rounded-t-2xl bg-transparent px-3 py-2.5 text-sm leading-relaxed focus:outline-none disabled:cursor-not-allowed"
             aria-label="Message the assistant"
           />
-          <button
-            type="submit"
-            disabled={!input.trim() || typing || !onboarding}
-            className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-spark text-white transition hover:bg-spark-dark disabled:opacity-40"
-            aria-label="Send"
-          >
-            <ArrowUp className="h-4 w-4" />
-          </button>
+
+          {/* Writing helper bar */}
+          <div className="flex items-center gap-1 border-t border-paper-line/70 px-1.5 py-1.5">
+            <div className="scrollbar-thin flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
+            <span className="flex shrink-0 items-center gap-1 pl-1 pr-0.5 text-[11px] font-semibold text-ink-muted">
+              <Wand2 className="h-3.5 w-3.5 text-spark" />
+              <span className="hidden sm:inline">Polish</span>
+            </span>
+            {Object.entries(REWRITE_MODES).map(([mode, m]) => (
+              <button
+                key={mode}
+                type="button"
+                title={m.hint}
+                onClick={() => rewrite(mode)}
+                disabled={!input.trim() || Boolean(rewriting) || !onboarding}
+                className={cn(
+                  'inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border px-2.5 py-1 text-xs font-medium transition disabled:opacity-40',
+                  rewriting === mode ? 'border-spark bg-spark-light text-spark-dark' : 'border-paper-line bg-white hover:border-spark hover:text-spark-dark'
+                )}
+              >
+                {rewriting === mode && <Loader2 className="h-3 w-3 animate-spin" />}
+                {m.label}
+              </button>
+            ))}
+            </div>
+            <button
+              type="button"
+              onClick={() => setExpanded((x) => !x)}
+              className="shrink-0 rounded-lg p-1.5 text-ink-muted hover:bg-paper-deep hover:text-ink"
+              aria-label={expanded ? 'Shrink text box' : 'Expand text box'}
+              title={expanded ? 'Shrink' : 'Expand'}
+            >
+              {expanded ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+            </button>
+            <button
+              type="submit"
+              disabled={!input.trim() || typing || !onboarding}
+              className="grid h-8 w-8 shrink-0 place-items-center rounded-xl bg-spark text-white transition hover:bg-spark-dark disabled:opacity-40"
+              aria-label="Send"
+            >
+              <ArrowUp className="h-4 w-4" />
+            </button>
+          </div>
         </form>
-        <p className="mt-1.5 flex items-center gap-1 px-1 text-[10px] text-ink-muted">
-          <Settings2 className="h-3 w-3" /> Enter to send · Shift+Enter for a new line
-        </p>
+
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[11px] text-ink-muted">
+          {stats.words > 0 ? (
+            <>
+              <span className="tabular-nums">{stats.words} words</span>
+              <span className={cn('tabular-nums', stats.longCount > 0 && 'font-medium text-amber-700')}>
+                {stats.longCount > 0
+                  ? `${stats.longCount} long sentence${stats.longCount === 1 ? '' : 's'} (longest ${stats.longest} words)`
+                  : `Longest sentence ${stats.longest} words`}
+              </span>
+            </>
+          ) : (
+            <span className="flex items-center gap-1">
+              <Settings2 className="h-3 w-3" /> Enter to send · Shift+Enter for a new line · drag the corner to resize
+            </span>
+          )}
+          {undoText !== null && (
+            <button type="button" onClick={undoSuggestion} className="inline-flex items-center gap-1 font-medium text-spark-dark hover:underline">
+              <Undo2 className="h-3 w-3" /> Undo rewrite
+            </button>
+          )}
+          {rewriteError && <span className="text-red-600">{rewriteError}</span>}
+        </div>
       </div>
 
       {modal && (
